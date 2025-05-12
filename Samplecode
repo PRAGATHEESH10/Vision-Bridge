@@ -1,0 +1,142 @@
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+import numpy as np
+import cv2
+import hailo
+import time
+import subprocess
+from threading import Lock
+
+from hailo_apps_infra.hailo_rpi_common import (
+    get_caps_from_pad,
+    get_numpy_from_buffer,
+    app_callback_class,
+)
+from hailo_apps_infra.detection_pipeline import GStreamerDetectionApp
+
+### Calibration Parameters ###
+FOCAL_LENGTH_PX = 1250
+CALIBRATION_OFFSET = 1.2
+IMAGE_HEIGHT = 960
+
+AVERAGE_HEIGHTS = {
+    "Bicycle": 1.1,
+    "Bus": 3.3,
+    "Electric pole": 5.8,
+    "Car": 1.4,
+    "Dog": 0.45,
+    "Motorcycle": 1.1,
+    "Traffic signs": 0.8,
+    "Person": 1.6,
+    "Uncovered manhole": 0.5,
+    "Tree": 3.5
+}
+
+class user_app_callback_class(app_callback_class):
+    def __init__(self):
+        super().__init__()
+        self.tts_lock = Lock()
+        self.last_tts_time = 0
+        self.tts_cooldown = 3.0
+
+    def speak_detection(self, label):
+        current_time = time.time()
+        with self.tts_lock:
+            if current_time - self.last_tts_time > self.tts_cooldown:
+                try:
+                    subprocess.Popen(
+                        ['/usr/bin/espeak', '-s', '150', f'{label} detected'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    self.last_tts_time = current_time
+                except Exception as e:
+                    print(f"TTS error: {str(e)}")
+
+def app_callback(pad, info, user_data):
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    user_data.increment()
+    string_to_print = f"Frame count: {user_data.get_count()}\n"
+
+    format, width, height = get_caps_from_pad(pad)
+    frame = None
+    if user_data.use_frame and format is not None and width is not None and height is not None:
+        frame = get_numpy_from_buffer(buffer, format, width, height)
+
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+
+    detection_count = 0
+    announced_labels = set()
+    
+    for detection in detections:
+        label = detection.get_label()
+        confidence = detection.get_confidence()
+        bbox = detection.get_bbox()
+
+        # Distance calculation (for audio alerts only)
+        distance = None
+        real_height = AVERAGE_HEIGHTS.get(label)
+        pixel_height = (bbox.ymax() - bbox.ymin()) * IMAGE_HEIGHT
+        if real_height and pixel_height > 0:
+            raw_distance = (real_height * FOCAL_LENGTH_PX) / pixel_height
+            distance = max(0, raw_distance - CALIBRATION_OFFSET)
+
+        # Announce logic: 2.3m for all, 5m for trees
+        announce = False
+        if confidence > 0.5 and label not in announced_labels and distance is not None:
+            if label.lower() == "tree":
+                if distance <= 5.0:
+                    announce = True
+            else:
+                if distance <= 2.3:
+                    announce = True
+            if announce:
+                user_data.speak_detection(label)
+            announced_labels.add(label)
+            dist_info = f" ({distance:.1f}m)" if distance is not None else ""
+            string_to_print += f"{label}{dist_info} detected (Confidence: {confidence:.2f})\n"
+
+        detection_count += 1
+
+        # Visual display: bounding box with label and confidence only
+        if user_data.use_frame and frame is not None:
+            x1 = int(bbox.xmin() * width)
+            y1 = int(bbox.ymin() * height)
+            x2 = int(bbox.xmax() * width)
+            y2 = int(bbox.ymax() * height)
+            
+            # Only show label and confidence (no distance)
+            text = f"{label} {int(confidence*100)}%"
+
+            (text_width, text_height), baseline = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            y_text = max(y1 - 10, text_height + 2)
+            cv2.rectangle(frame, 
+                          (x1, y_text - text_height - baseline),
+                          (x1 + text_width, y_text + baseline),
+                          (0, 255, 0), -1)
+            cv2.putText(frame, text, (x1, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    if user_data.use_frame and frame is not None:
+        cv2.putText(frame, f"Detections: {detection_count}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        user_data.set_frame(frame)
+
+    print(string_to_print)
+    return Gst.PadProbeReturn.OK
+
+if __name__ == "__main__":
+    user_data = user_app_callback_class()
+    app = GStreamerDetectionApp(app_callback, user_data)
+    app.run()
+
+
+
